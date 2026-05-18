@@ -282,8 +282,8 @@ Contributions are welcome! Here's how to get started:
 MIT License — see [LICENSE](LICENSE) for details.
 
 WebClaw is built on top of open-source projects:
-- [openclaw-zero-token](https://github.com) — MIT
-- [opencode](https://github.com) — MIT
+- [openclaw-zero-token](https://github.com/linuxhsj/openclaw-zero-token) — MIT
+- [opencode](https://github.com/sst/opencode) — MIT
 
 ---
 
