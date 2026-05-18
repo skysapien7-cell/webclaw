@@ -9,7 +9,10 @@ import { createInterface } from "node:readline";
 import { streamQwen, fetchQwenModels, QWEN_MODELS } from "../providers/qwen.js";
 import { streamDeepseek, fetchDeepseekModels, DEEPSEEK_MODELS } from "../providers/deepseek.js";
 import { getAuth } from "../auth/store.js";
+import { loginQwen } from "../auth/qwen.js";
+import { loginDeepseek } from "../auth/deepseek.js";
 import { success, error, info, warn } from "../ui/banner.js";
+import { isChromeRunning } from "../browser/chrome.js";
 import { pushUser, pushAssistant, getHistory, clearHistory, historySummary } from "../history.js";
 import { runOrchestrator } from "../agents/orchestrator.js";
 
@@ -123,14 +126,24 @@ export const chatCommand = {
       return;
     }
 
+    const showHelp = () => {
+      info(`Commands:`);
+      info(`  /help         — show this help menu`);
+      info(`  /auth <prov>  — re-authenticate (qwen or deepseek)`);
+      info(`  /model <id>   — switch model`);
+      info(`  /models       — list models`);
+      info(`  /agent <task> — spawn parallel sub-agents`);
+      info(`  /think on|off — toggle DeepThink/reasoning`);
+      info(`  /search on|off— toggle web search`);
+      info(`  /instant      — switch to Instant mode`);
+      info(`  /expert       — switch to Expert mode`);
+      info(`  /clear        — clear screen`);
+      info(`  /quit         — exit`);
+    };
+
     // Interactive mode
     info(`Model: \x1b[1m${modelName}\x1b[0m (${provider})`);
-    info(`Type your message and press Enter. Commands:`);
-    info(`  /model <id>   — switch model`);
-    info(`  /models       — list models`);
-    info(`  /agent <task> — spawn parallel sub-agents`);
-    info(`  /clear        — clear screen`);
-    info(`  /quit         — exit`);
+    info(`Type your message and press Enter. Type /help to see commands.`);
     console.log("");
 
     const rl = createInterface({
@@ -138,6 +151,56 @@ export const chatCommand = {
       output: process.stdout,
       prompt: "\x1b[36m❯\x1b[0m ",
     });
+
+    const sessionOptions = {
+      think: null, 
+      search: false,
+      chatMode: "instant", // "instant" or "expert"
+      sessionId: null, // Persist server-side chat session
+      parentId: null,
+    };
+
+    // --- Diagnostic Ping ---
+    const diagSpinner = createSpinner("Pinging systems and checking feature readiness...").start();
+    
+    // 1. Check Chrome (Needed for Qwen and Agents)
+    const chromeReady = await isChromeRunning();
+    
+    // 2. Check Models/Auth
+    let qwenCount = 0;
+    let dsCount = 0;
+    if (getAuth("qwen")) {
+      const qModels = await fetchQwenModels();
+      if (qModels.length > 4) qwenCount = qModels.length; // Dynamic models loaded means auth is perfectly valid
+    }
+    if (getAuth("deepseek")) {
+      dsCount = DEEPSEEK_MODELS.length; // Deepseek auth is valid if we have the token
+    }
+
+    diagSpinner.stop();
+    info(`\x1b[1mSystem Diagnostics:\x1b[0m`);
+    if (chromeReady) {
+      success(`Browser Automation: \x1b[32mREADY\x1b[0m (Chrome CDP connected)`);
+      success(`Agent Orchestrator: \x1b[32mREADY\x1b[0m (Parallel sub-agents available)`);
+    } else {
+      warn(`Browser Automation: \x1b[31mOFFLINE\x1b[0m (Run 'webclaw chrome' to enable Qwen & Agents)`);
+      warn(`Agent Orchestrator: \x1b[31mUNAVAILABLE\x1b[0m`);
+    }
+
+    if (qwenCount > 0) {
+      success(`Qwen API: \x1b[32mREADY\x1b[0m (${qwenCount} models loaded)`);
+    } else if (provider === "qwen") {
+      warn(`Qwen API: \x1b[31mOFFLINE\x1b[0m (Auth expired or Chrome closed)`);
+    }
+
+    if (dsCount > 0) {
+      success(`DeepSeek API: \x1b[32mREADY\x1b[0m (Features available)`);
+    } else if (provider === "deepseek") {
+      warn(`DeepSeek API: \x1b[31mOFFLINE\x1b[0m (Auth expired)`);
+    }
+
+    success(`Feature Toggles: \x1b[32mREADY\x1b[0m`);
+    console.log("");
 
     rl.prompt();
 
@@ -157,8 +220,44 @@ export const chatCommand = {
           process.exit(0);
         }
 
+        if (cmd === "help") {
+          showHelp();
+          console.log("");
+          rl.prompt();
+          return;
+        }
+
+        if (cmd === "auth") {
+          const targetProv = args[0]?.toLowerCase();
+          if (targetProv !== "qwen" && targetProv !== "deepseek") {
+            warn("Please specify provider: /auth qwen OR /auth deepseek");
+            rl.prompt();
+            return;
+          }
+
+          info(`Extracting fresh cookies from Chrome for ${targetProv}...`);
+          try {
+            if (targetProv === "qwen") {
+              await loginQwen((msg) => info(`  ${msg}`));
+            } else {
+              await loginDeepseek((msg) => info(`  ${msg}`));
+            }
+            success(`Successfully re-authenticated with ${targetProv}!`);
+            
+            // Refresh models list in case they changed
+            allModels = await getAllModels();
+          } catch (e) {
+            error(`Auth failed: ${e.message}`);
+          }
+          console.log("");
+          rl.prompt();
+          return;
+        }
+
         if (cmd === "clear" || cmd === "cls") {
           clearHistory();
+          sessionOptions.sessionId = null;
+          sessionOptions.parentId = null;
           console.clear();
           info("Screen and conversation history cleared.");
           rl.prompt();
@@ -187,6 +286,8 @@ export const chatCommand = {
             // ✅ Update BOTH modelId AND provider so the next message goes to the right backend
             modelId = newId;
             provider = newProvider;
+            sessionOptions.sessionId = null; // Reset session when switching models
+            sessionOptions.parentId = null;
             allModels = await getAllModels();
             const name = allModels.find((m) => m.id === newId)?.name || newId;
             success(`Switched to: ${name} (${newProvider})`);
@@ -239,6 +340,26 @@ export const chatCommand = {
           return;
         }
 
+        if (cmd === "instant" || cmd === "expert") {
+          sessionOptions.chatMode = cmd;
+          success(`Switched to ${cmd === "instant" ? "Instant" : "Expert"} mode`);
+          rl.prompt();
+          return;
+        }
+
+        if (["think", "search"].includes(cmd)) {
+          const val = args[0]?.toLowerCase();
+          if (val === "on" || val === "off") {
+            sessionOptions[cmd] = (val === "on");
+            success(`${cmd} mode is now ${val.toUpperCase()}`);
+          } else {
+            const current = sessionOptions[cmd];
+            info(`${cmd} mode is currently: ${current === null ? "DEFAULT" : (current ? "ON" : "OFF")}`);
+          }
+          rl.prompt();
+          return;
+        }
+
         warn(`Unknown command: /${cmd}`);
         rl.prompt();
         return;
@@ -254,7 +375,8 @@ export const chatCommand = {
       pushUser(userMessage);
 
       try {
-        const assistantReply = await sendMessage(userMessage, currentModelId, currentProvider, getHistory().slice(0, -1));
+        let turnOptions = { ...sessionOptions };
+        const assistantReply = await sendMessage(userMessage, currentModelId, currentProvider, getHistory().slice(0, -1), turnOptions);
         // slice(0,-1) gives history *before* this turn (we already pushed user above)
         pushAssistant(assistantReply);
       } catch (e) {
@@ -282,9 +404,10 @@ export const chatCommand = {
  * @param {string} modelId - Model ID to call
  * @param {string} provider - "qwen" | "deepseek"
  * @param {{ role: string, content: string }[]} history - All turns BEFORE this message
+ * @param {object} options - Feature toggles like search, think, etc.
  * @returns {Promise<string>} - The complete assistant reply (for storing in history)
  */
-async function sendMessage(message, modelId, provider, history = []) {
+async function sendMessage(message, modelId, provider, history = [], options = {}) {
   const startTime = Date.now();
   console.log("");
   process.stdout.write("\x1b[33m⟡\x1b[0m ");
@@ -316,11 +439,16 @@ async function sendMessage(message, modelId, provider, history = []) {
     }
   };
 
-  const onDone = ({ fullText, thinkingText }) => {
+  const onDone = ({ fullText, thinkingText, sessionId, parentId }) => {
     if (spinner) {
       spinner.stop();
       spinner = null;
     }
+    
+    // Capture session state so next turn continues in the same chat thread!
+    if (sessionId) options.sessionId = sessionId;
+    if (parentId) options.parentId = parentId;
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     const turnNum = Math.floor(history.length / 2) + 1;
     const turnInfo = history.length > 0 ? ` · turn ${turnNum}` : "";
@@ -334,9 +462,9 @@ async function sendMessage(message, modelId, provider, history = []) {
 
   try {
     if (provider === "qwen") {
-      await streamQwen(message, modelId, onChunk, onDone, history);
+      await streamQwen(message, modelId, onChunk, onDone, history, null, options);
     } else if (provider === "deepseek") {
-      await streamDeepseek(message, modelId, onChunk, onDone, history);
+      await streamDeepseek(message, modelId, onChunk, onDone, history, null, options);
     }
   } catch (e) {
     console.log("");

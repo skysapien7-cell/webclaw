@@ -8,7 +8,7 @@
  * Derived from openclaw-zero-token qwen-web-client-browser.ts
  */
 
-import { connectToChrome } from "../browser/chrome.js";
+import { connectToChrome, isChromeRunning } from "../browser/chrome.js";
 import { getAuth, saveAuth } from "../auth/store.js";
 import { randomUUID } from "node:crypto";
 import { buildContextMessage } from "../history.js";
@@ -28,6 +28,9 @@ export async function fetchQwenModels() {
   try {
     const auth = getAuth("qwen");
     if (!auth) return QWEN_MODELS;
+
+    // Fast fail if Chrome is not running to avoid 15s timeout
+    if (!(await isChromeRunning())) return QWEN_MODELS;
 
     const { browser, context } = await connectToChrome();
     const pages = context.pages();
@@ -63,14 +66,15 @@ export async function fetchQwenModels() {
  * Stream a chat response from Qwen International.
  * Runs fetch() INSIDE Chrome's browser context via page.evaluate().
  */
-export async function streamQwen(message, model = "qwen-max-latest", onChunk, onDone, history = [], signal) {
+export async function streamQwen(message, model = "qwen-max-latest", onChunk, onDone, history = [], signal, options = {}) {
   const auth = getAuth("qwen");
   if (!auth) {
     throw new Error("Not logged in to Qwen. Run: webclaw auth qwen");
   }
 
   // Build the full prompt: system prompt + history + current message
-  const contextMessage = buildContextMessage(message, history);
+  // If we are continuing an existing session, we just send the message
+  const contextMessage = options.sessionId ? message : buildContextMessage(message, history);
 
   const { browser, context } = await connectToChrome();
 
@@ -99,42 +103,60 @@ export async function streamQwen(message, model = "qwen-max-latest", onChunk, on
 
   const fid = randomUUID();
 
-  // Step 1: Create a new chat session (inside browser)
-  const createResult = await page.evaluate(async ({ baseUrl }) => {
-    try {
-      const res = await fetch(`${baseUrl}/api/v2/chats/new`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (!res.ok) {
-        return { ok: false, status: res.status, error: await res.text() };
+  let chatId = options.sessionId;
+  
+  if (!chatId) {
+    // Step 1: Create a new chat session (inside browser)
+    const createResult = await page.evaluate(async ({ baseUrl }) => {
+      try {
+        const res = await fetch(`${baseUrl}/api/v2/chats/new`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) {
+          return { ok: false, status: res.status, error: await res.text() };
+        }
+        const data = await res.json();
+        const newChatId = data.data?.id ?? data.chat_id ?? data.id ?? data.chatId;
+        return { ok: true, chatId: newChatId };
+      } catch (err) {
+        return { ok: false, status: 500, error: String(err) };
       }
-      const data = await res.json();
-      const chatId = data.data?.id ?? data.chat_id ?? data.id ?? data.chatId;
-      return { ok: true, chatId };
-    } catch (err) {
-      return { ok: false, status: 500, error: String(err) };
-    }
-  }, { baseUrl: "https://chat.qwen.ai" });
+    }, { baseUrl: "https://chat.qwen.ai" });
 
-  if (!createResult.ok || !createResult.chatId) {
-    throw new Error(`Failed to create Qwen chat: ${createResult.error || "No chat_id"}`);
+    if (!createResult.ok || !createResult.chatId) {
+      throw new Error(`Failed to create Qwen chat: ${createResult.error || "No chat_id"}`);
+    }
+    chatId = createResult.chatId;
   }
 
   // Step 2: Send message and stream via console interception
   return new Promise((resolve, reject) => {
     let fullText = "";
     let isStreamActive = true;
+    let parentId = options.parentId || null;
 
     const consoleHandler = (msg) => {
       if (!isStreamActive) return;
       const text = msg.text();
+      
+      if (text.startsWith(`QWEN_ERR_${fid}::`)) {
+        isStreamActive = false;
+        reject(new Error("Qwen API Error: " + text.slice(`QWEN_ERR_${fid}::`.length)));
+        return;
+      }
+      
       if (text.startsWith(`QWEN_SSE_${fid}::`)) {
         const dataStr = text.slice(`QWEN_SSE_${fid}::`.length).trim();
         if (dataStr === "[DONE]" || !dataStr) return;
         try {
           const parsed = JSON.parse(dataStr);
+          
+          if (parsed.id) {
+            parentId = parsed.id; // Capture assistant's message ID for next turn
+          }
+          
           const delta = parsed.choices?.[0]?.delta;
           if (delta && typeof delta.content === "string") {
             const isThinking = delta.phase === "think";
@@ -151,7 +173,7 @@ export async function streamQwen(message, model = "qwen-max-latest", onChunk, on
 
     page.on("console", consoleHandler);
 
-    page.evaluate(async ({ baseUrl, model, message, fid, chatId }) => {
+    page.evaluate(async ({ baseUrl, model, message, fid, chatId, options, parentId }) => {
       try {
         // Single-message format — safe and always accepted by the Qwen web API.
         const res = await fetch(`${baseUrl}/api/v2/chat/completions?chat_id=${chatId}`, {
@@ -159,18 +181,23 @@ export async function streamQwen(message, model = "qwen-max-latest", onChunk, on
           headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
           body: JSON.stringify({
             stream: true, version: "2.1", incremental_output: true, chat_id: chatId,
-            chat_mode: "normal", model: model, parent_id: null,
+            chat_mode: "normal", model: model, parent_id: parentId,
             messages: [{
-              fid, parentId: null, childrenIds: [], role: "user", content: message,
+              fid, parentId: parentId, childrenIds: [], role: "user", content: message,
               user_action: "chat", files: [], timestamp: Math.floor(Date.now() / 1000),
               models: [model], chat_type: "t2t",
-              feature_config: { thinking_enabled: true, output_schema: "phase" },
+              feature_config: { 
+                thinking_enabled: options.think !== null ? options.think : true, 
+                search_enabled: !!options.search,
+                output_schema: "phase" 
+              },
             }],
           }),
         });
 
         if (!res.ok) {
-          console.error(`QWEN_ERR_${fid}::${res.status}`);
+          const errText = await res.text().catch(() => "");
+          console.error(`QWEN_ERR_${fid}::HTTP ${res.status} - ${errText}`);
           return;
         }
 
@@ -195,11 +222,11 @@ export async function streamQwen(message, model = "qwen-max-latest", onChunk, on
       } catch (err) {
         console.error(`QWEN_ERR_${fid}::${err.message}`);
       }
-    }, { baseUrl: "https://chat.qwen.ai", model, message: contextMessage, fid, chatId: createResult.chatId })
+    }, { baseUrl: "https://chat.qwen.ai", model, message: contextMessage, fid, chatId, options, parentId })
       .then(() => {
         isStreamActive = false;
         page.off("console", consoleHandler);
-        onDone({ fullText });
+        onDone({ fullText, sessionId: chatId, parentId });
         resolve();
       })
       .catch((err) => {

@@ -7,7 +7,7 @@
  * Derived from openclaw-zero-token deepseek-web-client.ts
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getAuth } from "../auth/store.js";
 import { buildContextMessage } from "../history.js";
 
@@ -44,8 +44,8 @@ function makeHeaders(auth) {
     "Referer": "https://chat.deepseek.com/",
     "Origin": "https://chat.deepseek.com",
     "x-client-platform": "web",
-    "x-client-version": "1.7.0",
-    "x-app-version": "20241129.1",
+    "x-client-version": "2.0.0",
+    "x-app-version": "2.0.0",
     "x-client-locale": "zh_CN",
     "x-client-timezone-offset": "28800",
   };
@@ -145,30 +145,39 @@ export async function createSession(auth) {
     const res = await fetch(`${BASE}/api/v0/chat_session/create`, {
       method: "POST",
       headers: makeHeaders(auth),
-      body: JSON.stringify({}),
+      body: JSON.stringify({ character_id: null }),
     });
     if (res.ok) {
       const data = await res.json();
-      return data?.data?.biz_data?.id || data?.data?.biz_data?.chat_session_id || `webclaw_${Date.now()}`;
+      const sid = data?.data?.biz_data?.chat_session?.id
+              || data?.data?.biz_data?.id
+              || data?.data?.biz_data?.chat_session_id;
+      if (sid) return sid;
+    } else {
+      console.error(`Failed to create DeepSeek session: ${res.status}`);
     }
-  } catch { /* ignore */ }
-  return `webclaw_${Date.now()}`;
+  } catch (err) {
+    console.error(`Error creating DeepSeek session: ${err.message}`);
+  }
+  return randomUUID();
 }
 
 /**
  * Stream a chat response from DeepSeek.
  */
-export async function streamDeepseek(message, model = "deepseek_chat", onChunk, onDone, history = [], signal) {
+export async function streamDeepseek(message, model = "deepseek_chat", onChunk, onDone, history = [], signal, options = {}) {
   const auth = getAuth("deepseek");
   if (!auth) {
     throw new Error("Not logged in to DeepSeek. Run: webclaw auth deepseek");
   }
 
   const isReasoner = model === "deepseek_reasoner";
+  const thinkingEnabled = options.think !== null ? options.think : isReasoner;
   const targetPath = "/api/v0/chat/completion";
 
-  // Create session
-  const sessionId = await createSession(auth);
+  // Use provided session or create a new one
+  const sessionId = options.sessionId || await createSession(auth);
+  let parentMessageId = options.parentId || null;
 
   // Solve PoW challenge
   const powResponse = await solvePoW(auth, targetPath);
@@ -179,19 +188,20 @@ export async function streamDeepseek(message, model = "deepseek_chat", onChunk, 
     headers["x-ds-pow-response"] = powResponse;
   }
 
-  // Build the full prompt: system prompt + history + current message
-  const prompt = buildContextMessage(message, history);
+  // If continuing a session, don't resend history. Let the server handle it.
+  const prompt = options.sessionId ? message : buildContextMessage(message, history);
 
   const response = await fetch(`${BASE}${targetPath}`, {
     method: "POST",
     headers,
     body: JSON.stringify({
       chat_session_id: sessionId,
-      parent_message_id: null,
+      parent_message_id: parentMessageId,
       prompt,
       ref_file_ids: [],
-      thinking_enabled: isReasoner,
-      search_enabled: false,
+      thinking_enabled: thinkingEnabled,
+      search_enabled: !!options.search,
+      model_type: options.chatMode === "expert" ? "expert" : "default",
     }),
     signal,
   });
@@ -240,8 +250,10 @@ export async function streamDeepseek(message, model = "deepseek_chat", onChunk, 
           let reasoningDelta = null;
 
           // Proprietary DeepSeek SSE format
-          if (data.response_message_id) {
-            // Initial message / status updates
+          if (data.message_id) {
+            parentMessageId = data.message_id; // Capture the assistant's message ID
+          } else if (data.v?.response?.message_id) {
+            parentMessageId = data.v.response.message_id;
           }
 
           // Keep track of the active fragment type
@@ -297,7 +309,7 @@ export async function streamDeepseek(message, model = "deepseek_chat", onChunk, 
     reader.releaseLock();
   };
 
-  onDone({ fullText, thinkingText });
+  onDone({ fullText, thinkingText, sessionId, parentId: parentMessageId });
 }
 
 /**
