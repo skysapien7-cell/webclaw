@@ -74,7 +74,7 @@ export async function streamQwen(message, model = "qwen-max-latest", onChunk, on
 
   // Build the full prompt: system prompt + history + current message
   // If we are continuing an existing session, we just send the message
-  const contextMessage = options.sessionId ? message : buildContextMessage(message, history);
+  const contextMessage = options.sessionId ? message : buildContextMessage(message, history, options);
 
   const { browser, context } = await connectToChrome();
 

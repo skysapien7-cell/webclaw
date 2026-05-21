@@ -20,6 +20,7 @@ import { streamDeepseek, DEEPSEEK_MODELS } from "./src/providers/deepseek.js";
 import { getAuth } from "./src/auth/store.js";
 import { runOrchestrator } from "./src/agents/orchestrator.js";
 import { buildContextMessage } from "./src/history.js";
+import { runAgentLoop } from "./src/agents/loop.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 8324;
@@ -83,9 +84,28 @@ async function streamMessage(session, userText) {
   sendWs(session.id, "agent:status", { status: "running" }, seq++);
   sendWs(session.id, "agent:stream_start", { message_id: msgId, role: "assistant" }, seq++);
 
-  const history = session.messages.map((m) => ({ role: m.role, content: m.content }));
-
-  const prompt = buildContextMessage(userText, history);
+  // Custom history callbacks to store history in this specific session
+  let assistantPushedCount = 0;
+  const loopOptions = {
+    getHistory: () => session.messages.map((m) => ({ role: m.role, content: m.content })),
+    pushUser: (content) => {
+      session.messages.push({
+        id: randomUUID(),
+        role: "user",
+        content,
+        created_at: new Date().toISOString(),
+      });
+    },
+    pushAssistant: (content) => {
+      session.messages.push({
+        id: assistantPushedCount === 0 ? msgId : randomUUID(),
+        role: "assistant",
+        content,
+        created_at: new Date().toISOString(),
+      });
+      assistantPushedCount++;
+    },
+  };
 
   const onChunk = (chunk, isThinking) => {
     if (isThinking) return;
@@ -93,35 +113,32 @@ async function streamMessage(session, userText) {
     sendWs(session.id, "agent:stream_delta", { message_id: msgId, delta: chunk }, seq++);
   };
 
-  const onDone = () => {};
+  const onConfirm = async (tool, args) => {
+    // Notify the user in the streaming bubble that a tool is being executed
+    let note = `\n\n⚙️ **Running tool:** \`${tool}\``;
+    if (args.path) note += ` on \`${args.path}\``;
+    if (args.command) note += `: \`${args.command}\``;
+    note += `...\n`;
+    
+    sendWs(session.id, "agent:stream_delta", { message_id: msgId, delta: note }, seq++);
+    return true; // Auto-approve in GUI mode
+  };
 
   try {
     const { provider, modelId } = resolveModel(session.model);
-    if (provider === "qwen") {
-      await streamQwen(prompt, modelId, onChunk, onDone, []);
-    } else {
-      await streamDeepseek(prompt, modelId, onChunk, onDone, []);
-    }
+    const result = await runAgentLoop(userText, modelId, provider, loopOptions, onChunk, onConfirm);
+    fullText = result;
   } catch (err) {
     fullText = `Error: ${err.message}`;
-    sendWs(session.id, "agent:stream_delta", { message_id: msgId, delta: fullText }, seq++);
+    sendWs(session.id, "agent:stream_delta", { message_id: msgId, delta: `\n\n❌ **Error:** ${err.message}` }, seq++);
   }
 
   sendWs(session.id, "agent:stream_end", { message_id: msgId }, seq++);
 
-  // Persist the assistant message
-  const assistantMsg = {
-    id: msgId,
-    role: "assistant",
-    content: fullText,
-    created_at: new Date().toISOString(),
-  };
-  session.messages.push(assistantMsg);
   session.status = "idle";
   session.updated_at = new Date().toISOString();
 
   sendWs(session.id, "agent:status", { status: "completed", session }, seq++);
-  return assistantMsg;
 }
 
 /** Run multi-agent orchestration, streaming header + final answer via WS. */

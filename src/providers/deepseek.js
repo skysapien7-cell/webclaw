@@ -189,7 +189,7 @@ export async function streamDeepseek(message, model = "deepseek_chat", onChunk, 
   }
 
   // If continuing a session, don't resend history. Let the server handle it.
-  const prompt = options.sessionId ? message : buildContextMessage(message, history);
+  const prompt = options.sessionId ? message : buildContextMessage(message, history, options);
 
   const response = await fetch(`${BASE}${targetPath}`, {
     method: "POST",

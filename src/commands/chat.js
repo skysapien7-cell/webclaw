@@ -15,6 +15,7 @@ import { success, error, info, warn } from "../ui/banner.js";
 import { isChromeRunning } from "../browser/chrome.js";
 import { pushUser, pushAssistant, getHistory, clearHistory, historySummary } from "../history.js";
 import { runOrchestrator } from "../agents/orchestrator.js";
+import { runAgentLoop } from "../agents/loop.js";
 
 // ── Lightweight spinner that writes ONLY to stderr, never touches stdout ──
 // This avoids all conflicts with readline which owns stdout.
@@ -152,13 +153,139 @@ export const chatCommand = {
       prompt: "\x1b[36m❯\x1b[0m ",
     });
 
-    const sessionOptions = {
+    const cliState = {
+      modelId: modelId,
+      modelName: modelName,
+      provider: provider,
       think: null, 
       search: false,
       chatMode: "instant", // "instant" or "expert"
       sessionId: null, // Persist server-side chat session
       parentId: null,
+      streamingSpeed: 0,
+      isStreaming: false,
+      tokenCount: 0,
+      showStatusBar: true,
+      currentAction: "idle",  // "idle", "thinking...", "streaming...", "⚙️ read_file", etc.
+      streamStartTime: null,
     };
+
+    // ── Status Bar Rendering Engine ──
+    // Uses save/restore cursor + absolute row positioning to pin
+    // a 3-line box at the bottom of the terminal. This means the
+    // bar stays visible even while streaming output scrolls above it.
+
+    const stripAnsi = (str) => str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+
+    const drawStatusBar = () => {
+      if (!cliState.showStatusBar) return;
+
+      const cols = process.stdout.columns || 80;
+      const rows = process.stdout.rows || 24;
+      const innerWidth = Math.min(cols - 4, 90);
+      const boxWidth = innerWidth + 2; // +2 for the │ borders
+
+      // ── Collect segments ──
+      const modelDisp = `\x1b[1;36m${cliState.modelName || cliState.modelId}\x1b[0m`;
+      const modeDisp = cliState.chatMode === "expert"
+        ? "\x1b[1;35m\u{1F451} Expert\x1b[0m"
+        : "\x1b[1;36m\u26A1 Instant\x1b[0m";
+
+      const thinkDisp = cliState.think === true
+        ? "\x1b[1;33m\u{1F9E0} ON\x1b[0m"
+        : (cliState.think === false ? "\x1b[2m\u{1F9E0} OFF\x1b[0m" : "\x1b[2m\u{1F9E0} --\x1b[0m");
+
+      const searchDisp = cliState.search
+        ? "\x1b[1;32m\u{1F50D} ON\x1b[0m"
+        : "\x1b[2m\u{1F50D} OFF\x1b[0m";
+
+      // Context
+      const history = getHistory();
+      const histLen = JSON.stringify(history).length;
+      const pct = Math.min(100, (histLen / 500000) * 100).toFixed(0);
+      const ctxBar = buildMiniBar(parseFloat(pct), 8);
+      const ctxDisp = `\x1b[2mCtx ${ctxBar} ${pct}%\x1b[0m`;
+
+      // Speed
+      let speedDisp;
+      if (cliState.isStreaming && cliState.streamStartTime) {
+        const secs = (Date.now() - cliState.streamStartTime) / 1000;
+        const speed = secs > 0 ? (cliState.tokenCount / secs).toFixed(0) : "0";
+        speedDisp = `\x1b[1;33m${speed} t/s\x1b[0m`;
+      } else {
+        speedDisp = `\x1b[2midle\x1b[0m`;
+      }
+
+      // Action
+      let actionDisp;
+      if (cliState.currentAction && cliState.currentAction !== "idle") {
+        actionDisp = `\x1b[1;33m${cliState.currentAction}\x1b[0m`;
+      } else {
+        actionDisp = `\x1b[2mready\x1b[0m`;
+      }
+
+      const content = ` ${modelDisp} \x1b[2m│\x1b[0m ${modeDisp} \x1b[2m│\x1b[0m ${thinkDisp} \x1b[2m│\x1b[0m ${searchDisp} \x1b[2m│\x1b[0m ${ctxDisp} \x1b[2m│\x1b[0m ${speedDisp} \x1b[2m│\x1b[0m ${actionDisp} `;
+
+      // Pad the visible content to fill the box
+      const visLen = stripAnsi(content).length;
+      const pad = Math.max(0, innerWidth - visLen);
+      const paddedContent = content + " ".repeat(pad);
+
+      const topBorder    = `\x1b[2m\u250C${"\u2500".repeat(innerWidth)}\u2510\x1b[0m`;
+      const contentLine   = `\x1b[2m\u2502\x1b[0m${paddedContent}\x1b[2m\u2502\x1b[0m`;
+      const bottomBorder  = `\x1b[2m\u2514${"\u2500".repeat(innerWidth)}\u2518\x1b[0m`;
+
+      // Save cursor, draw at bottom 3 rows, restore cursor
+      process.stdout.write(
+        `\x1b[s` +                           // save cursor
+        `\x1b[${rows - 2};1H\x1b[K${topBorder}` +  // row: rows-2
+        `\x1b[${rows - 1};1H\x1b[K${contentLine}` + // row: rows-1
+        `\x1b[${rows};1H\x1b[K${bottomBorder}` +    // row: rows
+        `\x1b[u`                             // restore cursor
+      );
+    };
+
+    // Mini progress bar helper: ████░░░░ style
+    function buildMiniBar(percent, width) {
+      const filled = Math.round((percent / 100) * width);
+      const empty = width - filled;
+      return `\x1b[36m${"\u2588".repeat(filled)}\x1b[2m${"\u2591".repeat(empty)}\x1b[0m`;
+    }
+
+    const clearStatusBar = () => {
+      const rows = process.stdout.rows || 24;
+      process.stdout.write(
+        `\x1b[s` +
+        `\x1b[${rows - 2};1H\x1b[K` +
+        `\x1b[${rows - 1};1H\x1b[K` +
+        `\x1b[${rows};1H\x1b[K` +
+        `\x1b[u`
+      );
+    };
+
+    // Redraw the status bar on a fixed interval so it updates during streaming
+    let statusBarTimer = setInterval(() => {
+      if (cliState.showStatusBar) drawStatusBar();
+    }, 250);
+
+    // Also hook readline refresh so it draws during typing
+    const originalRefreshLine = rl._refreshLine;
+    rl._refreshLine = function() {
+      originalRefreshLine.call(rl);
+      drawStatusBar();
+    };
+
+    // Ensure we set up a scroll region that leaves room for the status bar
+    const setupScrollRegion = () => {
+      const rows = process.stdout.rows || 24;
+      process.stdout.write(`\x1b[1;${rows - 3}r`); // scroll region rows 1 to rows-3
+      process.stdout.write(`\x1b[${Math.max(1, rows - 4)};1H`); // move cursor into scroll region
+    };
+    setupScrollRegion();
+    process.stdout.on('resize', () => {
+      setupScrollRegion();
+      drawStatusBar();
+    });
 
     // --- Diagnostic Ping ---
     const diagSpinner = createSpinner("Pinging systems and checking feature readiness...").start();
@@ -235,6 +362,8 @@ export const chatCommand = {
             return;
           }
 
+          cliState.currentAction = "authenticating...";
+
           info(`Extracting fresh cookies from Chrome for ${targetProv}...`);
           try {
             if (targetProv === "qwen") {
@@ -250,14 +379,15 @@ export const chatCommand = {
             error(`Auth failed: ${e.message}`);
           }
           console.log("");
+          cliState.currentAction = "idle";
           rl.prompt();
           return;
         }
 
         if (cmd === "clear" || cmd === "cls") {
           clearHistory();
-          sessionOptions.sessionId = null;
-          sessionOptions.parentId = null;
+          cliState.sessionId = null;
+          cliState.parentId = null;
           console.clear();
           info("Screen and conversation history cleared.");
           rl.prompt();
@@ -286,10 +416,13 @@ export const chatCommand = {
             // ✅ Update BOTH modelId AND provider so the next message goes to the right backend
             modelId = newId;
             provider = newProvider;
-            sessionOptions.sessionId = null; // Reset session when switching models
-            sessionOptions.parentId = null;
+            cliState.modelId = newId;
+            cliState.provider = newProvider;
+            cliState.sessionId = null; // Reset session when switching models
+            cliState.parentId = null;
             allModels = await getAllModels();
             const name = allModels.find((m) => m.id === newId)?.name || newId;
+            cliState.modelName = name;
             success(`Switched to: ${name} (${newProvider})`);
           }
           rl.prompt();
@@ -298,7 +431,10 @@ export const chatCommand = {
 
         if (cmd === "agent" && args.length > 0) {
           const agentTask = args.join(" ");
+          
+          cliState.currentAction = "agent task...";
           rl.pause();
+          
           console.log("");
           info(`\x1b[1m🔧 Multi-Agent Task\x1b[0m`);
           info(`Task: ${agentTask}`);
@@ -335,13 +471,14 @@ export const chatCommand = {
           }
 
           console.log("");
+          cliState.currentAction = "idle";
           rl.resume();
           rl.prompt();
           return;
         }
 
         if (cmd === "instant" || cmd === "expert") {
-          sessionOptions.chatMode = cmd;
+          cliState.chatMode = cmd;
           success(`Switched to ${cmd === "instant" ? "Instant" : "Expert"} mode`);
           rl.prompt();
           return;
@@ -350,10 +487,10 @@ export const chatCommand = {
         if (["think", "search"].includes(cmd)) {
           const val = args[0]?.toLowerCase();
           if (val === "on" || val === "off") {
-            sessionOptions[cmd] = (val === "on");
+            cliState[cmd] = (val === "on");
             success(`${cmd} mode is now ${val.toUpperCase()}`);
           } else {
-            const current = sessionOptions[cmd];
+            const current = cliState[cmd];
             info(`${cmd} mode is currently: ${current === null ? "DEFAULT" : (current ? "ON" : "OFF")}`);
           }
           rl.prompt();
@@ -366,6 +503,11 @@ export const chatCommand = {
       }
 
       // Pause readline so our spinner doesn't fight with it
+      cliState.tokenCount = 0;
+      cliState.isStreaming = true;
+      cliState.streamStartTime = Date.now();
+      cliState.currentAction = "thinking...";
+
       rl.pause();
 
       // Record user turn in history, then send
@@ -375,15 +517,103 @@ export const chatCommand = {
       pushUser(userMessage);
 
       try {
-        let turnOptions = { ...sessionOptions };
-        const assistantReply = await sendMessage(userMessage, currentModelId, currentProvider, getHistory().slice(0, -1), turnOptions);
-        // slice(0,-1) gives history *before* this turn (we already pushed user above)
-        pushAssistant(assistantReply);
+        let turnOptions = { ...cliState };
+        
+        // Auto-detect if the message needs web search
+        const searchKeywords = /\b(news|weather|latest|current|today|stock|price|score|trending|search|google|look\s*up|find\s+online|what.s happening|headlines)\b/i;
+        if (!turnOptions.search && searchKeywords.test(userMessage)) {
+          turnOptions.search = true;
+          cliState.search = true; // persist for future turns
+          info(`\x1b[2m🔍 Auto-enabled web search for this query\x1b[0m`);
+        }
+        
+        console.log("");
+        process.stdout.write("\x1b[33m⟡\x1b[0m ");
+
+        let isThinkingMode = false;
+        let thinkingStarted = false;
+        let spinner = null;
+
+        const onChunk = (chunk, isThinking = false) => {
+          if (isThinking) {
+            if (!thinkingStarted) {
+              thinkingStarted = true;
+              isThinkingMode = true;
+              cliState.currentAction = "\u{1F4AD} thinking...";
+              spinner = createSpinner("Thinking...").start();
+            }
+          } else {
+            if (isThinkingMode) {
+              isThinkingMode = false;
+              cliState.currentAction = "streaming...";
+              if (spinner) {
+                spinner.stop();
+                spinner = null;
+              }
+            }
+            process.stdout.write(chunk);
+            cliState.tokenCount += Math.max(1, chunk.length / 4);
+          }
+        };
+
+        const onConfirm = async (tool, args) => {
+          if (spinner) {
+            spinner.stop();
+            spinner = null;
+          }
+          let promptText = "";
+          if (tool === "execute_command") {
+            promptText = `\x1b[33m⚠️ Run command '${args.command}'? (y/N):\x1b[0m `;
+          } else if (tool === "write_file") {
+            promptText = `\x1b[33m⚠️ Create/overwrite file '${args.path}'? (y/N):\x1b[0m `;
+          } else if (tool === "edit_file") {
+            promptText = `\x1b[33m⚠️ Modify file '${args.path}'? (y/N):\x1b[0m `;
+          } else if (tool === "browser_action") {
+            promptText = `\x1b[33m⚠️ Browser: '${args.command}'? (y/N):\x1b[0m `;
+          } else {
+            return true;
+          }
+
+          return new Promise((resolve) => {
+            rl.question(promptText, (answer) => {
+              const normalized = answer.trim().toLowerCase();
+              resolve(normalized === "y" || normalized === "yes");
+            });
+          });
+        };
+
+        const onToolRun = (toolName, toolArgs) => {
+          const shortPath = toolArgs.path ? toolArgs.path.split(/[/\\]/).pop() : '';
+          const shortCmd = toolArgs.command ? toolArgs.command.slice(0, 30) : '';
+          if (shortPath) {
+            cliState.currentAction = `\u2699\ufe0f ${toolName} \u2192 ${shortPath}`;
+          } else if (shortCmd) {
+            cliState.currentAction = `\u2699\ufe0f ${toolName} \u2192 ${shortCmd}`;
+          } else {
+            cliState.currentAction = `\u2699\ufe0f ${toolName}`;
+          }
+        };
+
+        const startTime = Date.now();
+        await runAgentLoop(userMessage, currentModelId, currentProvider, turnOptions, onChunk, onConfirm, onToolRun);
+
+        if (spinner) {
+          spinner.stop();
+          spinner = null;
+        }
+
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        const speed = elapsed > 0 ? (cliState.tokenCount / elapsed).toFixed(1) : "0.0";
+        console.log("");
+        console.log(`\x1b[2m── Done in ${elapsed}s (${speed} t/s)\x1b[0m`);
       } catch (e) {
         error(e.message);
       }
 
       // Restore terminal state and resume readline
+      cliState.isStreaming = false;
+      cliState.streamStartTime = null;
+      cliState.currentAction = "idle";
       process.stdout.write("\x1b[?25h"); // force show cursor
       console.log("");
       rl.resume();
@@ -391,6 +621,10 @@ export const chatCommand = {
     });
 
     rl.on("close", () => {
+      clearInterval(statusBarTimer);
+      clearStatusBar();
+      // Reset scroll region to full terminal
+      process.stdout.write(`\x1b[r`);
       console.log("");
       info("Goodbye!");
       process.exit(0);
@@ -413,6 +647,7 @@ async function sendMessage(message, modelId, provider, history = [], options = {
   process.stdout.write("\x1b[33m⟡\x1b[0m ");
 
   let charCount = 0;
+  let tokenCount = 0;
   let fullResponseText = "";
   let isThinkingMode = false;
   let thinkingStarted = false;
@@ -436,6 +671,7 @@ async function sendMessage(message, modelId, provider, history = [], options = {
       process.stdout.write(chunk);
       fullResponseText += chunk;
       charCount += chunk.length;
+      tokenCount += Math.max(1, chunk.length / 4);
     }
   };
 
@@ -450,13 +686,14 @@ async function sendMessage(message, modelId, provider, history = [], options = {
     if (parentId) options.parentId = parentId;
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const speed = elapsed > 0 ? (tokenCount / elapsed).toFixed(1) : "0.0";
     const turnNum = Math.floor(history.length / 2) + 1;
     const turnInfo = history.length > 0 ? ` · turn ${turnNum}` : "";
     console.log("");
     if (thinkingText) {
-      console.log(`\x1b[2m── 💭 Thought for ${elapsed}s · ${charCount} chars${turnInfo}\x1b[0m`);
+      console.log(`\x1b[2m── 💭 Thought for ${elapsed}s · ${charCount} chars (${speed} t/s)${turnInfo}\x1b[0m`);
     } else {
-      console.log(`\x1b[2m── ${charCount} chars · ${elapsed}s${turnInfo}\x1b[0m`);
+      console.log(`\x1b[2m── ${charCount} chars · ${elapsed}s (${speed} t/s)${turnInfo}\x1b[0m`);
     }
   };
 
