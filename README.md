@@ -290,8 +290,7 @@ WebClaw is built on top of open-source projects:
 
 <div align="center">
 
-Made with ❤️ by [skysapien7-cell](https://github.com/skysapien7-cell)
+## 👨‍💻 Contributors
 
-**⭐ Star this repo if WebClaw saves you money on AI API bills!**
-
-</div>
+* **[rahulbaiga](https://github.com/skysapien7-cell)** - Creator & Lead Developer
+* **WebClaw / Antigravity AI** - AI Co-Pilot & Contributor
