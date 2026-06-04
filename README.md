@@ -39,6 +39,21 @@ No API keys. No subscriptions. No rate-limit billing. Just AI.
 
 ---
 
+## 🔮 Upcoming Features (R&D Roadmap)
+
+We are actively engineering advanced autonomous capabilities natively into our CDP-based architecture, bringing feature parity with high-end tools like Claude Code, Hermes, and OpenClaw:
+
+- **Zero-Touch Automatic Login:** Headless background Chrome execution for seamless authentication and session persistence.
+- **Graph-Based & Vector Memory:** Deep, cross-session memory integration using [agentmemory](https://github.com/rohitg00/agentmemory) and [graphify](https://github.com/safishamsi/graphify) to preserve context efficiently and map complex agent relationships.
+- **Agentic Tool Loops & Auto-Approval:** Autonomous execution of terminal commands, with smart pausing for destructive tasks.
+- **Browser Tab Multiplexing:** Running parallel subagents simultaneously in isolated, hidden Chrome tabs.
+- **Automated Session Refreshing:** Bridging memory context and summarization to keep stateful web chats fast and hallucination-free.
+- **Semantic Codebase Search (JIT RAG):** Local vector search to supply the AI with precise code snippets instead of overloading the context window.
+- **Sandboxed Execution & Auto-Healing:** Running background servers and automatically parsing stack traces to self-heal bugs.
+- **Resilient Diff Integration:** Strict search/replace patching locally that integrates directly with `git diff`.
+
+---
+
 ## 📦 Prerequisites
 
 - **Node.js** `>= 20.0.0`
